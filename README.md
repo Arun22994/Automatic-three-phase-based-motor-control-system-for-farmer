@@ -1,0 +1,2 @@
+# Automatic-three-phase-based-motor-control-system-for-farmer
+The IoT-Based Three-Phase Power Monitoring and Alert System monitors the availability of all three power phases in real time. It detects phase failures, displays the status using indicator LEDs, and sends instant alerts to the user's smartphone through IoT. The system improves safety, reduces downtime, and protects electrical equipment.
