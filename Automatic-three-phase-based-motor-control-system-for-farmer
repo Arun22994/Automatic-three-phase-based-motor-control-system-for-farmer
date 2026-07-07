@@ -1,0 +1,259 @@
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <ArduinoJson.h>
+
+// ==========================================
+// 1. CONFIGURATION
+// ==========================================
+const char* WIFI_SSID = "!!";         // <--- DOUBLE CHECK THIS
+const char* WIFI_PASSWORD = "achuaswin"; 
+
+#define API_KEY "AIzaSyDjJ9A89dvqOHR--XaCuhHy18584E4QiCs"
+// NOTE: Removed https:// and the trailing /
+#define DATABASE_URL "motordashboard-default-rtdb.asia-southeast1.firebasedatabase.app"
+
+#define DEVICE_ID "motor-001"
+
+#define PIN_PHASE_R 12
+#define PIN_PHASE_Y 13
+#define PIN_PHASE_B 14
+#define PIN_RELAY 2
+
+#define LOOP_INTERVAL_MS 500       // Checked commands every 500ms
+#define PHASE_CONFIRM_MS 5000
+#define BROADCAST_INTERVAL_MS 2000 // Send status every 2 seconds
+
+// ==========================================
+// 2. SYSTEM STATE
+// ==========================================
+enum MotorMode { MODE_IDLE, MODE_RUNNING, MODE_FAULT };
+
+struct SystemState {
+  bool phaseR = false, phaseY = false, phaseB = false;
+  bool motorOn = false, autoMode = true;
+  MotorMode mode = MODE_IDLE;
+  bool faultActive = false;
+  String faultMsg = "";
+  uint32_t uptimeSec = 0;
+  uint32_t autoTimerStart = 0;
+  bool autoTimerRunning = false;
+  float tempC = 0.0;
+  int rssi = 0;
+  float current = 0.0;
+  int timerProgress = 0;
+};
+
+SystemState sys;
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+bool firebaseReady = false;
+unsigned long lastPublish = 0;
+unsigned long lastCommandCheck = 0;
+String lastProcessedCommandId = "";
+
+// ==========================================
+// 3. LOGIC FUNCTIONS
+// ==========================================
+
+void readPhases() {
+  sys.phaseR = digitalRead(PIN_PHASE_R);
+  sys.phaseY = digitalRead(PIN_PHASE_Y);
+  sys.phaseB = digitalRead(PIN_PHASE_B);
+}
+
+void logEvent(String msg, String type = "info") {
+  if (!Firebase.ready()) return;
+  String path = String("esp32/") + DEVICE_ID + "/logs";
+  FirebaseJson json;
+  json.set("msg", msg);
+  json.set("type", type);
+  Firebase.RTDB.pushJSON(&fbdo, path, &json);
+  Serial.println("Log: " + msg);
+}
+
+void setRelay(bool on, const char* reason) {
+  if (sys.motorOn == on) return;
+  digitalWrite(PIN_RELAY, on ? HIGH : LOW);
+  sys.motorOn = on;
+  sys.mode = on ? MODE_RUNNING : (sys.faultActive ? MODE_FAULT : MODE_IDLE);
+  logEvent(String("Relay ") + (on ? "ON" : "OFF") + ": " + reason);
+}
+
+void checkFaults() {
+  if (!sys.motorOn) return;
+  bool all = sys.phaseR && sys.phaseY && sys.phaseB;
+  if (!all) {
+    sys.faultActive = true;
+    sys.faultMsg = "Phase fault detected";
+    sys.mode = MODE_FAULT;
+    setRelay(false, "Phase fault");
+  }
+}
+
+void runAutoLogic() {
+  bool all = sys.phaseR && sys.phaseY && sys.phaseB;
+  unsigned long now = millis();
+  if (sys.faultActive) return;
+
+  if (all && !sys.motorOn) {
+    if (!sys.autoTimerRunning) {
+      sys.autoTimerStart = now;
+      sys.autoTimerRunning = true;
+    }
+    sys.timerProgress = ((now - sys.autoTimerStart) * 100ULL) / PHASE_CONFIRM_MS;
+    if (sys.timerProgress >= 100) {
+      setRelay(true, "Auto start after 5s stability");
+      sys.autoTimerRunning = false;
+      sys.timerProgress = 0;
+    }
+  } else {
+    sys.autoTimerRunning = false;
+    sys.timerProgress = 0;
+  }
+}
+
+String buildJsonState() {
+  StaticJsonDocument<512> doc;
+  doc["connected"] = true;
+  doc["motorOn"] = sys.motorOn;
+  doc["autoMode"] = sys.autoMode;
+  doc["mode"] = (sys.mode == MODE_RUNNING) ? "RUNNING" : (sys.mode == MODE_FAULT ? "FAULT" : "IDLE");
+  doc["faultActive"] = sys.faultActive;
+  doc["faultMsg"] = sys.faultMsg;
+  doc["uptime"] = sys.uptimeSec;
+  doc["rssi"] = sys.rssi;
+  doc["tempC"] = sys.tempC;
+  doc["current"] = sys.current;
+  doc["timerProgress"] = sys.timerProgress;
+
+  JsonObject phases = doc.createNestedObject("phases");
+  phases["R"] = sys.phaseR; phases["Y"] = sys.phaseY; phases["B"] = sys.phaseB;
+
+  JsonObject voltage = doc.createNestedObject("voltage");
+  voltage["R"] = sys.phaseR ? 230.0 : 0; voltage["Y"] = sys.phaseY ? 230.0 : 0; voltage["B"] = sys.phaseB ? 230.0 : 0;
+
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
+
+void publishState() {
+  if (!Firebase.ready()) return;
+  String path = String("esp32/") + DEVICE_ID + "/status";
+  FirebaseJson json;
+  json.setJsonData(buildJsonState());
+  if (Firebase.RTDB.setJSON(&fbdo, path, &json)) {
+    Serial.println("↑ Status uploaded to " + path);
+  } else {
+    Serial.println("FAILED status upload: " + fbdo.errorReason());
+  }
+}
+
+void processCommands() {
+  if (!Firebase.ready()) return;
+  String path = String("esp32/") + DEVICE_ID + "/commands";
+
+  if (Firebase.RTDB.getJSON(&fbdo, path)) {
+    if (fbdo.dataType() == "json") {
+      FirebaseJson* json = fbdo.jsonObjectPtr();
+      size_t count = json->iteratorBegin();
+      String lastCmdId = "";
+      for (size_t i = 0; i < count; i++) {
+        String key, value; int type;
+        json->iteratorGet(i, type, key, value);
+        lastCmdId = key;
+      }
+      json->iteratorEnd();
+
+      if (lastCmdId != "" && lastCmdId != lastProcessedCommandId) {
+        if (Firebase.RTDB.getJSON(&fbdo, path + "/" + lastCmdId)) {
+          String cmdStr = fbdo.stringData();
+          StaticJsonDocument<256> doc;
+          deserializeJson(doc, cmdStr);
+          const char* cmd = doc["cmd"];
+
+          Serial.println("↓ Received Command: " + String(cmd));
+
+          if (strcmp(cmd, "MOTOR_ON") == 0) {
+            if (!sys.faultActive && sys.phaseR && sys.phaseY && sys.phaseB) {
+              setRelay(true, "Remote Start");
+            }
+          } else if (strcmp(cmd, "MOTOR_OFF") == 0) {
+            setRelay(false, "Remote Stop");
+          } else if (strcmp(cmd, "SET_AUTO") == 0) {
+            sys.autoMode = doc["payload"]["value"];
+          } else if (strcmp(cmd, "RESET_FAULT") == 0) {
+            sys.faultActive = false;
+            sys.faultMsg = "";
+            sys.mode = MODE_IDLE;
+          }
+          lastProcessedCommandId = lastCmdId;
+          Firebase.RTDB.deleteNode(&fbdo, path + "/" + lastCmdId);
+        }
+      }
+    }
+  }
+}
+
+// ==========================================
+// 4. SETUP & LOOP
+// ==========================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n\n--- Motor Control System Booting ---");
+
+  pinMode(PIN_PHASE_R, INPUT);
+  pinMode(PIN_PHASE_Y, INPUT);
+  pinMode(PIN_PHASE_B, INPUT);
+  pinMode(PIN_RELAY, OUTPUT);
+  digitalWrite(PIN_RELAY, LOW);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi: " + String(WIFI_SSID));
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500); Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected! IP: " + WiFi.localIP().toString());
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  Serial.println("Logging into Firebase...");
+  Firebase.signUp(&config, &auth, "", "");
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // Initial Sync
+  String path = String("esp32/") + DEVICE_ID;
+  Firebase.RTDB.setString(&fbdo, path + "/deviceId", DEVICE_ID);
+  
+  firebaseReady = true;
+  Serial.println("Firebase Ready. Device ID: " + String(DEVICE_ID));
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // Tasks
+  if (now - lastCommandCheck > LOOP_INTERVAL_MS) {
+    lastCommandCheck = now;
+    readPhases();
+    checkFaults();
+    if (sys.autoMode) runAutoLogic();
+    processCommands();
+  }
+
+  if (now - lastPublish >= BROADCAST_INTERVAL_MS) {
+    lastPublish = now;
+    sys.uptimeSec++;
+    sys.rssi = WiFi.RSSI();
+    // Simulation logic (replace with real sensor readings)
+    sys.current = sys.motorOn ? 4.5 : 0.0;
+    sys.tempC = 25.0 + (random(0, 50) / 10.0);
+    publishState();
+  }
+}
